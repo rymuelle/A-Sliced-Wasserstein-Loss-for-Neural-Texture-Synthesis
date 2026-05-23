@@ -75,7 +75,7 @@ class VGG19(torch.nn.Module):
         return [block1_conv1, block1_conv2, block2_conv1, block2_conv2, block3_conv1, block3_conv2, block3_conv3, block3_conv4, block4_conv1, block4_conv2, block4_conv3, block4_conv4]
 
 class SlicingLoss(nn.Module):
-    def __init__(self, scaling_factor, vgg_model=None):
+    def __init__(self, scaling_factor, vgg_model=None, n_direction_scale=1):
         super(SlicingLoss, self).__init__()
         if vgg_model is None:
             vgg_model = VGG19()
@@ -87,6 +87,7 @@ class SlicingLoss(nn.Module):
         for param in self.vgg.parameters():
             param.requires_grad = False
         self.vgg.eval()
+        self.n_direction_scale = n_direction_scale
 
     def forward(self, image_generated, image_example):
         list_activations_generated = self.vgg(image_generated)
@@ -108,7 +109,7 @@ class SlicingLoss(nn.Module):
             activations_generated = list_activations_generated[l].view(b, dim, n * repeat_factor)
             
             # Sample random directions on the correct device
-            n_direction = dim
+            n_direction = int(dim * self.n_direction_scale) 
             directions = torch.randn(n_direction, dim, device=device)
             directions = directions / torch.sqrt(torch.sum(directions**2, dim=1, keepdim=True))
             
@@ -122,6 +123,55 @@ class SlicingLoss(nn.Module):
             
             # L2 over sorted lists
             loss += torch.mean((sorted_activations_example - sorted_activations_generated) ** 2)
+            
+        return loss
+    
+
+class GramLoss(nn.Module):
+    def __init__(self, scaling_factor=None, vgg_model=None):
+        """
+        Args:
+            scaling_factor: Retained for API compatibility with SlicingLoss, 
+                            but unused since Gram matrices inherently handle size differences.
+            vgg_model: Pre-trained VGG model.
+        """
+        super(GramLoss, self).__init__()
+        if vgg_model is None:
+            vgg_model = VGG19()
+            state_dict = get_and_load_pth("https://github.com/rymuelle/A-Sliced-Wasserstein-Loss-for-Neural-Texture-Synthesis/releases/download/V0.1.0/vgg19.pth")
+            vgg_model.load_state_dict(state_dict)
+        self.vgg = vgg_model
+        
+        # Freeze VGG parameters
+        for param in self.vgg.parameters():
+            param.requires_grad = False
+        self.vgg.eval()
+
+    def _get_gram_matrix(self, activation):
+        b, c, h, w = activation.size()
+        features = activation.view(b, c, h * w)
+        
+        # Compute Gram matrix: Multiplies features by their transpose
+        # Resulting shape: (batch_size, channels, channels)
+        gram = torch.bmm(features, features.transpose(1, 2))
+        
+        # Normalize by total number of elements to make it invariant to image/feature size
+        return gram / (c * h * w)
+
+    def forward(self, image_generated, image_example):
+        list_activations_generated = self.vgg(image_generated)
+        list_activations_example = self.vgg(image_example)
+        
+        loss = 0.0
+        
+        # Iterate over VGG layers
+        for l in range(len(list_activations_example)):
+            # Compute normalized Gram matrices for both images
+            gram_generated = self._get_gram_matrix(list_activations_generated[l])
+            gram_example = self._get_gram_matrix(list_activations_example[l])
+            
+            # Mean Squared Error (L2 loss) between the Gram matrices
+            loss += torch.mean((gram_generated - gram_example) ** 2)
             
         return loss
     
